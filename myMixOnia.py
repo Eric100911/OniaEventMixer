@@ -32,6 +32,12 @@ def main():
         # "/eos/home-c/chiw/JpsiJpsiUps/tryHelac/HELAC-Onia-2.7.6/PROC_HO_31/P0_addon_pp_NOnia_MPS/output/sample_pp_nonia_mps.lhe": 1, # Upsilon source
     }
     eventList = eu.MPSOniaMixer.mix_from_recipe(mixRecipe, maxEvents = 50000)
+    # Apply a filter to the events
+    for event in eventList:
+        for particle in event.particles:
+            if particle.pdgId == 443 and particle.eta > 2.5:
+                eventList.remove(event)
+                break
     eu.LHEParser("sample_pp_psipsi_sps.lhe").setEvents(eventList).write("psipsipsi_tps_mixed.lhe")
 
 if __name__ == "__main__":
