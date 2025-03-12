@@ -27,10 +27,12 @@ from EventUtils import EventUtils as eu
             
 def main():
     mixRecipe = {
-        "sample_pp_psipsi_dps_mixed.lhe": 2
+        "/eos/home-c/chiw/JpsiJpsiUps/tryHelac/HELAC-Onia-2.7.6/PROC_HO_30/P0_addon_pp_NOnia_MPS/output/sample_pp_nonia_mps.lhe": 3 # Jpsi source
+
+        # "/eos/home-c/chiw/JpsiJpsiUps/tryHelac/HELAC-Onia-2.7.6/PROC_HO_31/P0_addon_pp_NOnia_MPS/output/sample_pp_nonia_mps.lhe": 1, # Upsilon source
     }
-    eventList = eu.MPSOniaMixer.mix_from_recipe(mixRecipe, maxEvents = 100)
-    eu.LHEParser("sample_pp_psipsi_dps_mixed.lhe").setEvents(eventList).write("quad_jpsi_qps_midex.lhe")
+    eventList = eu.MPSOniaMixer.mix_from_recipe(mixRecipe, maxEvents = 50000)
+    eu.LHEParser("sample_pp_psipsi_sps.lhe").setEvents(eventList).write("psipsipsi_tps_mixed.lhe")
 
 if __name__ == "__main__":
     main()
