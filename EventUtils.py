@@ -43,6 +43,7 @@
 [Usage]
     python3 myMixTPS.py sample_pp_psi_sps.lhe triple_jpsi_mixed.lhe
 '''
+import math
 
 class EventUtils:
 
@@ -96,6 +97,12 @@ class EventUtils:
         def perp(self):
             # The magnitude of the transverse component.
             return (self.__vecXYZ[0]**2 + self.__vecXYZ[1]**2)**0.5
+
+        @property
+        def eta(self):
+            # Pseudorapidity of the particle.
+            pz = self.__vecXYZ[2]
+            return 0.5 * math.log((self.E + pz) / (self.E - pz))
 
         # Operator + for adding two Lorentz vectors.
         def __add__(self, other):
