@@ -1,9 +1,112 @@
 import re
+import math
 import argparse
 from itertools import zip_longest
 
-def read_events(filename, max_events=None):
-    """从指定文件读取最多max_events个事件"""
+def parse_filter_conditions(filter_str):
+    """解析过滤条件字符串为结构化数据"""
+    conditions = []
+    if not filter_str:
+        return conditions
+    
+    for cond in filter_str.split(','):
+        parts = cond.split(':')
+        if len(parts) != 2:
+            raise ValueError(f"无效过滤条件格式: {cond}")
+        
+        pdg = int(parts[0])
+        expr = parts[1]
+        
+        # 解析比较运算符
+        operators = ['>=', '<=', '>', '<']
+        op = None
+        for o in operators:
+            if o in expr:
+                op = o
+                param, value = expr.split(o, 1)
+                break
+        
+        if not op:
+            raise ValueError(f"无效运算符: {expr}")
+        
+        conditions.append({
+            'pdg': pdg,
+            'param': param.strip(),
+            'op': op,
+            'value': float(value)
+        })
+    return conditions
+
+def calculate_kinematics(px, py, pz, energy):
+    """计算粒子运动学参数"""
+    pT = math.sqrt(px**2 + py**2)
+    try:
+        eta = 0.5 * math.log((energy + pz) / (energy - pz)) if energy != pz else 0.0
+    except:
+        eta = 0.0
+    phi = math.atan2(py, px)
+    return {
+        'pT': pT,
+        'eta': eta,
+        'phi': phi,
+        'energy': energy,
+        'pz': pz
+    }
+
+def check_event(event_str, conditions):
+    """检查事件是否满足所有过滤条件"""
+    if not conditions:
+        return True
+    
+    event_lines = event_str.strip().split('\n')
+    particles = event_lines[2:-1]  # 跳过事件头和尾
+    
+    for cond in conditions:
+        pdg = cond['pdg']
+        param = cond['param']
+        op = cond['op']
+        threshold = cond['value']
+        
+        # 查找匹配的粒子
+        matched = False
+        for p_line in particles:
+            parts = p_line.strip().split()
+            if len(parts) < 11:
+                continue
+            
+            if int(parts[0]) != pdg:
+                continue
+                
+            # 解析四动量
+            px = float(parts[6])
+            py = float(parts[7])
+            pz = float(parts[8])
+            energy = float(parts[9])
+            
+            # 计算运动学参数
+            kinematics = calculate_kinematics(px, py, pz, energy)
+            value = kinematics.get(param, None)
+            if value is None:
+                continue
+                
+            # 进行比较
+            if op == '>' and not (value > threshold):
+                return False
+            elif op == '<' and not (value < threshold):
+                return False
+            elif op == '>=' and not (value >= threshold):
+                return False
+            elif op == '<=' and not (value <= threshold):
+                return False
+        
+        # 如果该条件类型需要至少一个粒子存在
+        if not any(int(p.split()[0]) == pdg for p in particles):
+            return False  # 如果要求必须存在该粒子
+            
+    return True
+
+def read_events(filename, max_events=None, filter_conditions=None):
+    """从文件读取事件并过滤"""
     pre_lines = []
     events = []
     post_lines = []
@@ -18,12 +121,17 @@ def read_events(filename, max_events=None):
                 current_event = [line]
             elif line.strip().startswith('</event>'):
                 current_event.append(line)
-                events.append(''.join(current_event))
+                event_str = ''.join(current_event)
+                
+                # 应用过滤条件
+                if check_event(event_str, filter_conditions):
+                    events.append(event_str)
+                    count += 1
+                    if max_events and count >= max_events:
+                        break
+                
                 current_event = []
                 in_event = False
-                count += 1
-                if max_events and count >= max_events:
-                    break
             elif in_event:
                 current_event.append(line)
             else:
@@ -144,28 +252,34 @@ def batch_generator(event_pools, batch_sizes):
                 return
         yield batch
 
-def main(files_config, output_file):
+def main(files_config, output_file, max_total_events, filter_conditions):
     """主处理函数"""
-    # 从各文件读取事件池
     event_pools = []
     batch_sizes = []
-    # 确定最终生成的合并后事件数量，考虑到每个文件的最大事件分组数，取最小值
-    max_groups = min(fc['max_events'] // fc['events_per_group'] for fc in files_config)
+    
+    # 计算最大可生成组数
+    max_groups = min(
+        len(file_info['events']) // fc['events_per_group']
+        for fc, file_info in zip(files_config, [read_events(fc['filename'], fc['max_events'], filter_conditions) for fc in files_config])
+    )
+    
+    # 加载事件池
     for fc in files_config:
-        file_info = read_events(fc['filename'], fc['max_events'])
-        event_pool = file_info['events'][:fc['events_per_group'] * max_groups]
-        event_pools.append(event_pool)
+        file_info = read_events(fc['filename'], fc['max_events'], filter_conditions)
+        required = fc['events_per_group'] * max_groups
+        event_pools.append(file_info['events'][:required])
         batch_sizes.append(fc['events_per_group'])
     
-    # 创建批次生成器
+    # 生成合并事件
     generator = batch_generator(event_pools, batch_sizes)
-    
-    # 合并所有批次
     merged_events = []
+    
     for event_group in generator:
+        if len(merged_events) >= max_total_events:
+            break
         merged_events.append(merge_event_group(event_group))
     
-    # 写入文件（使用第一个文件的头信息）
+    # 写入文件
     first_file_info = read_events(files_config[0]['filename'], 0)
     with open(output_file, 'w') as f:
         f.writelines(first_file_info['pre'])
@@ -174,24 +288,35 @@ def main(files_config, output_file):
         f.writelines(first_file_info['post'])
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='LHE事件混合工具')
+    parser = argparse.ArgumentParser(description='高级LHE事件混合工具')
     parser.add_argument('-o', '--output', required=True, help='输出文件路径')
     parser.add_argument('-f', '--files', nargs='+', required=True,
-                        help="输入文件配置，格式为 filename:每组数量:最大总数 如 file1.lhe:2:10 file2.lhe:1:5")
+                       help="输入文件配置，格式为 filename:每组数量:最大事件数")
+    parser.add_argument('--max-events', type=int, default=None,
+                       help='最大生成事件总数')
+    parser.add_argument('--filter', type=str, default=None,
+                       help='粒子过滤条件，格式如 443:pT>10,13:eta<2.5')
     
     args = parser.parse_args()
     
-    # 解析增强型文件配置
+    # 解析文件配置
     files_config = []
     for item in args.files:
         parts = item.split(':')
         if len(parts) != 3:
-            raise ValueError("文件参数格式错误，应使用 filename:每组数量:最大总数")
-        
+            raise ValueError("参数格式错误，应使用 filename:每组数量:最大事件数")
         files_config.append({
             'filename': parts[0],
             'events_per_group': int(parts[1]),
             'max_events': int(parts[2])
         })
     
-    main(files_config, args.output)
+    # 解析过滤条件
+    filter_conditions = parse_filter_conditions(args.filter) if args.filter else []
+    
+    main(
+        files_config=files_config,
+        output_file=args.output,
+        max_total_events=args.max_events if args.max_events else float('inf'),
+        filter_conditions=filter_conditions
+    )
