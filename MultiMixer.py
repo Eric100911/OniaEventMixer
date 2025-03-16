@@ -99,10 +99,6 @@ def check_event(event_str, conditions):
                 return False
             elif op == '<=' and not (value <= threshold):
                 return False
-        
-        # 如果该条件类型需要至少一个粒子存在
-        if not any(int(p.split()[0]) == pdg for p in particles):
-            return False  # 如果要求必须存在该粒子
             
     return True
 
