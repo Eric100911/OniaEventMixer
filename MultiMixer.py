@@ -1,5 +1,6 @@
 import re
 import math
+import numpy as np
 import argparse
 from itertools import zip_longest
 
@@ -252,7 +253,7 @@ def batch_generator(event_pools, batch_sizes):
                 return
         yield batch
 
-def main(files_config, output_file, max_total_events, filter_conditions):
+def main(files_config, output_file, max_total_events, filter_conditions, shuffle, seed):
     """主处理函数"""
     event_pools = []
     batch_sizes = []
@@ -269,6 +270,14 @@ def main(files_config, output_file, max_total_events, filter_conditions):
         required = fc['events_per_group'] * max_groups
         event_pools.append(file_info['events'][:required])
         batch_sizes.append(fc['events_per_group'])
+    
+    # 如果需要随机排序
+    if shuffle:
+        # 设置随机种子
+        np.random.seed(seed)
+        # 对每个事件池进行随机排序
+        for i in range(len(event_pools)):
+            np.random.shuffle(event_pools[i])
     
     # 生成合并事件
     generator = batch_generator(event_pools, batch_sizes)
@@ -296,6 +305,10 @@ if __name__ == '__main__':
                        help='最大生成事件总数')
     parser.add_argument('--filter', type=str, default=None,
                        help='粒子过滤条件，格式如 443:pT>10,13:eta<2.5')
+    parser.add_argument('--shuffle', action='store_true',
+                       help='是否对事件池进行随机排序')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='随机种子，用于控制随机排序的可重复性')
     
     args = parser.parse_args()
     
@@ -318,5 +331,7 @@ if __name__ == '__main__':
         files_config=files_config,
         output_file=args.output,
         max_total_events=args.max_events if args.max_events else float('inf'),
-        filter_conditions=filter_conditions
+        filter_conditions=filter_conditions,
+        shuffle=args.shuffle,
+        seed=args.seed
     )
