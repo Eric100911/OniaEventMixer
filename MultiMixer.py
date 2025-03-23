@@ -4,7 +4,7 @@ import json
 import random
 import math
 import itertools as it
-from typing import Dict, List, Generator, Tuple
+from typing import Dict, List, Generator, Tuple, Optional
 import pylhe
 from pylhe import LHEEvent, LHEEventInfo, LHEParticle, LHEFile, LHEInit
 
@@ -43,15 +43,38 @@ class ParticleSource:
         self.file_iter = iter(self.files)
 
 class EventMixer:
-    def __init__(self, config: Dict, filters: List[str] = None,
-                 shuffle: bool = False, seed: int = None,
-                 squash: bool = False):
-        self.config = config
-        self.filters = filters or []
-        self.shuffle = shuffle
-        self.seed = seed
-        self.squash = squash
-        self.rng = random.Random(seed)
+    def __init__(self, 
+                 config: Dict,
+                 # 新增配置参数
+                 output: Optional[str] = None,
+                 max_events: Optional[int] = None,
+                 # 原有参数
+                 filters: Optional[List[str]] = None,
+                 shuffle: Optional[bool] = None,
+                 seed: Optional[int] = None,
+                 squash: Optional[bool] = None):
+        """
+        参数优先级：
+        1. 显式传入的参数 (最高)
+        2. JSON配置参数
+        3. 默认值
+        """
+        
+        # 必须参数
+        self.config = config['sources']
+        
+        # 合并逻辑
+        self.output = output or config.get('output', 'output.lhe')
+        self.max_events = max_events if max_events is not None else config.get('max_events', None)
+        
+        # 原有参数合并
+        self.filters = filters if filters is not None else config.get('filters', [])
+        self.shuffle = shuffle if shuffle is not None else config.get('shuffle', False)
+        self.seed = seed if seed is not None else config.get('seed', None)
+        self.squash = squash if squash is not None else config.get('squash', False)
+        
+        # 初始化随机数
+        self.rng = random.Random(self.seed)
         self.sources = {
             name: ParticleSource(cfg, shuffle, seed)
             for name, cfg in config["sources"].items()
@@ -70,7 +93,7 @@ class EventMixer:
         lhe_file.init = LHEInit(**tmp_raw_init)
         
         # 添加事件数据
-        lhe_file.events = list(self.generate())
+        lhe_file.events = list(it.islice(self.generate(), self.max_events))
         
         # 添加文件头元数据
         lhe_file.header_blocks = [
@@ -83,7 +106,7 @@ class EventMixer:
     def _count_total_events(self) -> int:
         """预计算总事件数用于元数据"""
         try:
-            return sum(1 for _ in self.generate())
+            return max(sum(1 for _ in self.generate()), self.max_events or 0)
         except Exception as e:
             print(f"WARNING: Event counting failed: {str(e)}")
             return 0
@@ -161,6 +184,9 @@ class EventMixer:
 
         merged.particles.insert(0, gluon1)
         merged.particles.insert(1, gluon2)
+
+        # Update the number of particles
+        merged.eventinfo.nparticles = len(merged.particles)
 
         return merged
 
@@ -257,22 +283,62 @@ class EventMixer:
             else:
                 break  # 所有生成器已耗尽
 
+def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
+    """合并命令行参数到配置字典"""
+    merged = config.copy()
+    
+    if args.output is not None:
+        merged['output'] = args.output
+    if args.max_events is not None:
+        merged['max_events'] = args.max_events
+    if args.filters is not None:
+        merged['filters'] = args.filters
+    if args.shuffle is not None:
+        merged['shuffle'] = args.shuffle
+    if args.seed is not None:
+        merged['seed'] = args.seed
+    if args.squash is not None:
+        merged['squash'] = args.squash
+    
+    return merged
+
 def main():
-    parser = argparse.ArgumentParser(description='Advanced LHE Event Mixer')
-    parser.add_argument('-c', '--config', required=True, help='JSON config file')
-    parser.add_argument('-o', '--output', required=True, help='Output LHE file')
-    parser.add_argument('--filter', action='append', help='Particle filters')
-    parser.add_argument('--shuffle', action='store_true', help='Shuffle input files')
-    parser.add_argument('--seed', type=int, help='Random seed')
-    parser.add_argument('--squash', action='store_true', help='Enable squash mode')
+    parser = argparse.ArgumentParser(description='LHE事件混合器')
+    parser.add_argument('--config', required=True, type=str, 
+                      help='JSON配置文件路径')
+    parser.add_argument('--output', type=str, default=None,
+                      help='覆盖配置文件中的输出路径')
+    parser.add_argument('--max-events', type=int, default=None,
+                      help='最大输出事件数（覆盖配置）')
+    parser.add_argument('--filters', action='append', default=None,
+                      help='粒子过滤条件，格式: PID:EXPR (可多次使用)')
+    parser.add_argument('--shuffle', action=argparse.BooleanOptionalAction, 
+                      default=None, help='是否随机混合')
+    parser.add_argument('--seed', type=int, default=None,
+                      help='随机数种子')
+    parser.add_argument('--squash', action=argparse.BooleanOptionalAction,
+                      default=None, help='压缩重复事件')
+    
     args = parser.parse_args()
+    
+    # 加载配置文件
+    try:
+        with open(args.config, 'r') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"配置文件 {args.config} 不存在")
+    except json.JSONDecodeError:
+        raise ValueError(f"配置文件 {args.config} 格式错误")
 
-    with open(args.config) as f:
-        config = json.load(f)
+    # 参数合并
+    merged_config = merge_args(config, args)
 
+    output_path = merged_config.get('output', 'output.lhe')
+    
+    # 初始化混合器
     mixer = EventMixer(
-        config=config,
-        filters=args.filter,
+        config=merged_config,
+        filters=args.filters,
         shuffle=args.shuffle,
         seed=args.seed,
         squash=args.squash
@@ -281,7 +347,7 @@ def main():
     output_file = mixer.to_lhe_file()
     pylhe.write_lhe_file_path(
         lhefile=output_file,
-        filepath=args.output
+        filepath=output_path
     )
 
 
