@@ -1,333 +1,289 @@
-import re
-import math
-import numpy as np
+#!/usr/bin/env python3
 import argparse
-from itertools import zip_longest
+import json
+import random
+import math
+import itertools as it
+from typing import Dict, List, Generator, Tuple
+import pylhe
+from pylhe import LHEEvent, LHEEventInfo, LHEParticle, LHEFile, LHEInit
 
-def parse_filter_conditions(filter_str):
-    """解析过滤条件字符串为结构化数据"""
-    conditions = []
-    if not filter_str:
-        return conditions
+class ColorManager:
+    def __init__(self):
+        self._base_per_sector = 100  # 每个sector的基础间隔
+        self._current_sector = -1       # 当前sector索引
+        self._sector_maps = []          # 每个sector的颜色映射表
+
+    def next_sector(self) -> None:
+        """切换到下一个颜色区间"""
+        self._current_sector += 1
+        self._sector_maps.append({})     # 为新sector初始化空映射表
+
+    def get_color(self, original: int) -> int:
+        """获取映射后的颜色编号"""
+        if original == 0:
+            return 0
+        # 获取当前sector的映射表
+        current_map = self._sector_maps[self._current_sector]
+        if original not in current_map:
+            # 计算新颜色：基础值 + 原始计数器的偏移（确保每个sector独立递增）
+            base = self._current_sector * self._base_per_sector
+            new_color = base + 500 + len(current_map) + 1
+            current_map[original] = new_color
+        return current_map[original]
+
+class ParticleSource:
+    def __init__(self, config: Dict, shuffle: bool, seed: int):
+        self.files = config["files"]
+        self.count = config["count"]
+        self.shuffle = shuffle
+        self.rng = random.Random(seed)
+        if shuffle:
+            self.rng.shuffle(self.files)
+        self.file_iter = iter(self.files)
+
+class EventMixer:
+    def __init__(self, config: Dict, filters: List[str] = None,
+                 shuffle: bool = False, seed: int = None,
+                 squash: bool = False):
+        self.config = config
+        self.filters = filters or []
+        self.shuffle = shuffle
+        self.seed = seed
+        self.squash = squash
+        self.rng = random.Random(seed)
+        self.sources = {
+            name: ParticleSource(cfg, shuffle, seed)
+            for name, cfg in config["sources"].items()
+        }
+        # Read init info from the first file of the first source
+        self.lhe_file_init = pylhe.read_lhe_init(self.sources[next(iter(self.sources))].files[0])
+
+    def to_lhe_file(self) -> LHEFile:
+        """生成完整的LHE文件对象"""
+        lhe_file = LHEFile()
+        
+        # 设置初始化信息
+        tmp_raw_init = self.lhe_file_init.copy()
+        tmp_raw_init["nevents"] = self._count_total_events()
+        tmp_raw_init["weightgroup"] = {} # Just to avoid pylhe error
+        lhe_file.init = LHEInit(**tmp_raw_init)
+        
+        # 添加事件数据
+        lhe_file.events = list(self.generate())
+        
+        # 添加文件头元数据
+        lhe_file.header_blocks = [
+            '<!-- Merged by EventMixer -->',
+            '<!-- Source config: {} -->'.format(json.dumps(self.config))
+        ]
+        
+        return lhe_file
     
-    for cond in filter_str.split(','):
-        parts = cond.split(':')
-        if len(parts) != 2:
-            raise ValueError(f"无效过滤条件格式: {cond}")
-        
-        pdg = int(parts[0])
-        expr = parts[1]
-        
-        # 解析比较运算符
-        operators = ['>=', '<=', '>', '<']
-        op = None
-        for o in operators:
-            if o in expr:
-                op = o
-                param, value = expr.split(o, 1)
-                break
-        
-        if not op:
-            raise ValueError(f"无效运算符: {expr}")
-        
-        conditions.append({
-            'pdg': pdg,
-            'param': param.strip(),
-            'op': op,
-            'value': float(value)
-        })
-    return conditions
+    def _count_total_events(self) -> int:
+        """预计算总事件数用于元数据"""
+        try:
+            return sum(1 for _ in self.generate())
+        except Exception as e:
+            print(f"WARNING: Event counting failed: {str(e)}")
+            return 0
 
-def calculate_kinematics(px, py, pz, energy):
-    """计算粒子运动学参数"""
-    pT = math.sqrt(px**2 + py**2)
-    try:
-        eta = 0.5 * math.log((energy + pz) / (energy - pz)) if energy != pz else 0.0
-    except:
-        eta = 0.0
-    phi = math.atan2(py, px)
-    return {
-        'pT': pT,
-        'eta': eta,
-        'phi': phi,
-        'energy': energy,
-        'pz': pz
-    }
 
-def check_event(event_str, conditions):
-    """检查事件是否满足所有过滤条件"""
-    if not conditions:
+    def _pass_filters(self, event: LHEEvent) -> bool:
+        for p in event.particles:
+            for condition in self.filters:
+                pid, expr = condition.split(':', 1)
+                if p.id == int(pid):
+                    pT = math.hypot(p.px, p.py)
+                    eta = 0.5 * math.log((p.e + p.pz)/(p.e - p.pz)) if (p.e != abs(p.pz)) else 999
+                    if not eval(expr, {'pT': pT, 'eta': eta, 'abs': abs}):
+                        return False
         return True
-    
-    event_lines = event_str.strip().split('\n')
-    particles = event_lines[2:-1]  # 跳过事件头和尾
-    
-    for cond in conditions:
-        pdg = cond['pdg']
-        param = cond['param']
-        op = cond['op']
-        threshold = cond['value']
-        
-        # 查找匹配的粒子
-        matched = False
-        for p_line in particles:
-            parts = p_line.strip().split()
-            if len(parts) < 11:
-                continue
-            
-            if int(parts[0]) != pdg:
-                continue
-                
-            # 解析四动量
-            px = float(parts[6])
-            py = float(parts[7])
-            pz = float(parts[8])
-            energy = float(parts[9])
-            
-            # 计算运动学参数
-            kinematics = calculate_kinematics(px, py, pz, energy)
-            value = kinematics.get(param, None)
-            if value is None:
-                continue
-                
-            # 进行比较
-            if op == '>' and not (value > threshold):
-                return False
-            elif op == '<' and not (value < threshold):
-                return False
-            elif op == '>=' and not (value >= threshold):
-                return False
-            elif op == '<=' and not (value <= threshold):
-                return False
-            
-    return True
 
-def read_events(filename, max_events=None, filter_conditions=None):
-    """从文件读取事件并过滤"""
-    pre_lines = []
-    events = []
-    post_lines = []
-    current_event = []
-    in_event = False
-    count = 0
-
-    with open(filename, 'r') as f:
-        for line in f:
-            if line.strip().startswith('<event>'):
-                in_event = True
-                current_event = [line]
-            elif line.strip().startswith('</event>'):
-                current_event.append(line)
-                event_str = ''.join(current_event)
-                
-                # 应用过滤条件
-                if check_event(event_str, filter_conditions):
-                    events.append(event_str)
-                    count += 1
-                    if max_events and count >= max_events:
-                        break
-                
-                current_event = []
-                in_event = False
-            elif in_event:
-                current_event.append(line)
-            else:
-                if not events and not in_event:
-                    pre_lines.append(line)
-                else:
-                    post_lines.append(line)
-    return {
-        'pre': pre_lines,
-        'events': events,
-        'post': post_lines,
-        'filename': filename
-    }
-
-def adjust_particles(particles, base_index, color_offset):
-    """调整粒子索引和颜色标签"""
-    adjusted = []
-    for p in particles:
-        parts = p.strip().split()
-        
-        # 调整母粒子索引
-        mothers = []
-        for idx in [2,3]:
-            original = int(parts[idx])
-            if original > 0:
-                mothers.append(str(original + base_index))
-            else:
-                mothers.append(str(original))
-        
-        # 调整颜色标签
-        colors = []
-        for idx in [4,5]:
-            original = parts[idx]
-            if original != '0':
-                colors.append(str(int(original) + color_offset))
-            else:
-                colors.append(original)
-        
-        # 重组粒子行
-        new_p = parts[:2] + mothers + colors + parts[6:]
-        adjusted.append('  '.join(new_p))
-    return adjusted
-
-def merge_event_group(event_group):
-    """合并一个事件组（多个事件）为一个复合事件"""
-    total_particles = 0
-    total_weight = 1.0
-    color_offset = 0
-    all_particles = []
-    event_headers = []
-
-    # 收集所有事件头信息
-    for event_str in event_group:
-        event_lines = event_str.strip().split('\n')
-        header = event_lines[1].strip().split()
-        event_headers.append({
-            'npart': int(header[0]),
-            'weight': float(header[2]),
-            'scale': header[3],
-            'alpha_qed': header[4],
-            'alpha_qcd': header[5]
-        })
-
-    # 处理每个事件
-    for idx, event_str in enumerate(event_group):
-        event_lines = event_str.strip().split('\n')
-        particles = event_lines[2:-1]
-        
-        # 调整当前事件的粒子
-        adjusted = adjust_particles(
-            particles,
-            base_index=total_particles,
-            color_offset=color_offset
-        )
-        all_particles.extend(adjusted)
-        
-        # 更新累积参数
-        total_particles += event_headers[idx]['npart']
-        total_weight *= event_headers[idx]['weight']
-        
-        # 更新颜色偏移
-        max_color = max(int(tag) for p in particles 
-                      for tag in p.strip().split()[4:6] 
-                      if tag != '0') or 0
-        color_offset += max_color + 1
-
-    # 构建新事件头
-    new_header = [
-        str(total_particles),        # 总粒子数
-        '999',                        # 过程代码
-        f"{total_weight:.6E}",        # 合并权重
-        event_headers[0]['scale'],    # 标度
-        event_headers[0]['alpha_qed'],# alpha_QED
-        event_headers[0]['alpha_qcd'] # alpha_QCD
-    ]
-
-    return '\n'.join([
-        '<event>',
-        '  ' + '  '.join(new_header),
-        *['  '.join(p.split()) for p in all_particles],
-        '</event>'
-    ])
-
-def batch_generator(event_pools, batch_sizes):
-    """生成事件批次的生成器"""
-    iterators = []
-    for pool, size in zip(event_pools, batch_sizes):
-        # 将事件池按指定大小分块
-        chunks = [pool[i:i+size] for i in range(0, len(pool), size)]
-        iterators.append(iter(chunks))
-    
-    while True:
-        batch = []
-        for it in iterators:
+    def _event_generator(self, files: List[str]) -> Generator[LHEEvent, None, None]:
+        for f in files:
             try:
-                batch.extend(next(it))
-            except StopIteration:
-                return
-        yield batch
+                for event in pylhe.read_lhe_with_attributes(f):
+                    if self._pass_filters(event):
+                        yield event
+            except Exception as e:
+                print(f"Error reading {f}: {str(e)}")
+                continue
+    def _calculate_beam_momentum_dir(self, events: List[LHEEvent]) -> Tuple[float, float, float]:
+        total_px = sum(p.px for e in events for p in e.particles if p.status == -1)
+        total_py = sum(p.py for e in events for p in e.particles if p.status == -1)
+        total_pz = sum(p.pz for e in events for p in e.particles if p.status == -1)
+        norm = math.hypot(total_px, total_py, total_pz)
+        return (total_px/norm, total_py/norm, total_pz/norm) if norm !=0 else (0.0, 0.0, 1.0)
 
-def main(files_config, output_file, max_total_events, filter_conditions, shuffle, seed):
-    """主处理函数"""
-    event_pools = []
-    batch_sizes = []
-    
-    # 计算最大可生成组数
-    max_groups = min(
-        len(file_info['events']) // fc['events_per_group']
-        for fc, file_info in zip(files_config, [read_events(fc['filename'], fc['max_events'], filter_conditions) for fc in files_config])
+    def _squash_initial_gluons(self, events: List[LHEEvent]) -> LHEEvent:
+        # 创建新的初态胶子对
+        total_energy = sum(p.e for e in events for p in e.particles if p.status == -1)
+        dx, dy, dz = self._calculate_beam_momentum_dir(events)
+        p_mag = total_energy / 2.0
+
+        gluon1 = LHEParticle(
+            id=21, status=-1,
+            mother1=0, mother2=0,
+            color1=1000, color2=1001,
+            px=p_mag * dx, py=p_mag * dy, pz=p_mag * dz,
+            e=p_mag, m=0.0,
+            lifetime=0.0, spin=0.0
+        )
+        gluon2 = LHEParticle(
+            id=21, status=-1,
+            mother1=0, mother2=0,
+            color1=1001, color2=1000,
+            px=-p_mag * dx, py=-p_mag * dy, pz=-p_mag * dz,
+            e=p_mag, m=0.0,
+            lifetime=0.0, spin=0.0
+        )
+
+        # Dealing with colored final state particles.
+        merged = LHEEvent(events[0].eventinfo, [])
+        prev_color2 = 1001 
+
+        for event in events:
+            for p in event.particles:
+                if p.status == 1:
+                    new_p = p
+                    new_p.mother1 = 1
+                    new_p.mother2 = 2
+                    if p.color1 != 0 and p.color2 != 0:
+                        new_p.color1 = prev_color2
+                        new_p.color2 = prev_color2 + 1
+                        prev_color2 += 1
+                    merged.particles.append(new_p)
+
+        # If new colored particles are added, reconnect gluon2 color.
+        if prev_color2 != 1001:
+            gluon2.color2 = prev_color2
+
+        merged.particles.insert(0, gluon1)
+        merged.particles.insert(1, gluon2)
+
+        return merged
+
+    def _merge_events(self, events: List[LHEEvent]) -> LHEEvent:
+        """处理母子关系合并的核心方法"""
+        all_particles = []
+        mother_index_map = {}
+        color_mgr = ColorManager()
+
+        # 第一阶段：收集所有粒子并建立索引映射
+        global_index = 0
+        for event_idx, event in enumerate(events):
+            index_offset = global_index
+            local_mother_map = {}
+
+            # 更新颜色区间
+            color_mgr.next_sector()
+
+            # 处理每个粒子的新索引
+            for part_idx, particle in enumerate(event.particles):
+                new_index = global_index
+                local_mother_map[part_idx + 1] = new_index + 1  # LHE索引从1开始
+                global_index += 1
+
+                # 创建新粒子（暂不处理母子关系）
+                new_particle = particle
+                new_particle.color1 = color_mgr.get_color(particle.color1)
+                new_particle.color2 = color_mgr.get_color(particle.color2)
+                all_particles.append(new_particle)
+                mother_index_map[(event_idx, part_idx + 1)] = new_index + 1
+
+            # 更新母子关系映射
+            for part in all_particles[index_offset:]:
+                if part.mother1 > 0:
+                    part.mother1 = local_mother_map.get(part.mother1, 0)
+                if part.mother2 > 0:
+                    part.mother2 = local_mother_map.get(part.mother2, 0)
+
+        # 第二阶段：跨事件母子关系处理
+        for particle in all_particles:
+            if particle.mother1 > 0:
+                original_event = next((e_idx for e_idx, e in enumerate(events) 
+                                     if particle in e.particles), 0)
+                original_index = particle.mother1
+                particle.mother1 = mother_index_map.get((original_event, original_index), 0)
+            
+            if particle.mother2 > 0:
+                original_event = next((e_idx for e_idx, e in enumerate(events) 
+                                     if particle in e.particles), 0)
+                original_index = particle.mother2
+                particle.mother2 = mother_index_map.get((original_event, original_index), 0)
+
+        # 构建事件元数据
+        base_info = events[0].eventinfo if events else LHEEventInfo(
+            nparticles=0, pid=-1, weight=1.0, scale=0.0, aqed=0.007297, aqcd=0.118)
+        
+        event_info = LHEEventInfo(
+            nparticles=len(all_particles),
+            pid=base_info.pid,
+            weight=sum(e.eventinfo.weight for e in events),
+            scale=base_info.scale,
+            aqed=base_info.aqed,
+            aqcd=base_info.aqcd
+        )
+
+        return LHEEvent(eventinfo=event_info, particles=all_particles)
+
+    def generate(self) -> Generator[LHEEvent, None, None]:
+        generators = {
+            name: self._event_generator(source.files)
+            for name, source in self.sources.items()
+        }
+
+        # 记录活跃的生成器
+        active_generators = set(generators.keys())
+
+        while active_generators:
+            batch = []
+            for name in list(active_generators):  # 避免迭代时修改集合
+                source = self.sources[name]
+                try:
+                    # 显式调用next()触发StopIteration
+                    events = [next(generators[name]) for _ in range(source.count)]
+                    batch.extend(events)
+                except StopIteration:
+                    # 生成器耗尽后移出活跃列表
+                    active_generators.remove(name)
+
+            if batch:
+                if self.squash:
+                    yield self._squash_initial_gluons(batch)
+                else:
+                    yield self._merge_events(batch)
+            else:
+                break  # 所有生成器已耗尽
+
+def main():
+    parser = argparse.ArgumentParser(description='Advanced LHE Event Mixer')
+    parser.add_argument('-c', '--config', required=True, help='JSON config file')
+    parser.add_argument('-o', '--output', required=True, help='Output LHE file')
+    parser.add_argument('--filter', action='append', help='Particle filters')
+    parser.add_argument('--shuffle', action='store_true', help='Shuffle input files')
+    parser.add_argument('--seed', type=int, help='Random seed')
+    parser.add_argument('--squash', action='store_true', help='Enable squash mode')
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        config = json.load(f)
+
+    mixer = EventMixer(
+        config=config,
+        filters=args.filter,
+        shuffle=args.shuffle,
+        seed=args.seed,
+        squash=args.squash
     )
-    
-    # 加载事件池
-    for fc in files_config:
-        file_info = read_events(fc['filename'], fc['max_events'], filter_conditions)
-        required = fc['events_per_group'] * max_groups
-        event_pools.append(file_info['events'][:required])
-        batch_sizes.append(fc['events_per_group'])
-    
-    # 如果需要随机排序
-    if shuffle:
-        # 设置随机种子
-        np.random.seed(seed)
-        # 对每个事件池进行随机排序
-        for i in range(len(event_pools)):
-            np.random.shuffle(event_pools[i])
-    
-    # 生成合并事件
-    generator = batch_generator(event_pools, batch_sizes)
-    merged_events = []
-    
-    for event_group in generator:
-        if len(merged_events) >= max_total_events:
-            break
-        merged_events.append(merge_event_group(event_group))
-    
-    # 写入文件
-    first_file_info = read_events(files_config[0]['filename'], 0)
-    with open(output_file, 'w') as f:
-        f.writelines(first_file_info['pre'])
-        f.write('\n'.join(merged_events))
-        f.write('\n')
-        f.writelines(first_file_info['post'])
+
+    output_file = mixer.to_lhe_file()
+    pylhe.write_lhe_file_path(
+        lhefile=output_file,
+        filepath=args.output
+    )
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='高级LHE事件混合工具')
-    parser.add_argument('-o', '--output', required=True, help='输出文件路径')
-    parser.add_argument('-f', '--files', nargs='+', required=True,
-                       help="输入文件配置，格式为 filename:每组数量:最大事件数")
-    parser.add_argument('--max-events', type=int, default=None,
-                       help='最大生成事件总数')
-    parser.add_argument('--filter', type=str, default=None,
-                       help='粒子过滤条件，格式如 443:pT>10,13:eta<2.5')
-    parser.add_argument('--shuffle', action='store_true',
-                       help='是否对事件池进行随机排序')
-    parser.add_argument('--seed', type=int, default=None,
-                       help='随机种子，用于控制随机排序的可重复性')
-    
-    args = parser.parse_args()
-    
-    # 解析文件配置
-    files_config = []
-    for item in args.files:
-        parts = item.split(':')
-        if len(parts) != 3:
-            raise ValueError("参数格式错误，应使用 filename:每组数量:最大事件数")
-        files_config.append({
-            'filename': parts[0],
-            'events_per_group': int(parts[1]),
-            'max_events': int(parts[2])
-        })
-    
-    # 解析过滤条件
-    filter_conditions = parse_filter_conditions(args.filter) if args.filter else []
-    
-    main(
-        files_config=files_config,
-        output_file=args.output,
-        max_total_events=args.max_events if args.max_events else float('inf'),
-        filter_conditions=filter_conditions,
-        shuffle=args.shuffle,
-        seed=args.seed
-    )
+    main()
