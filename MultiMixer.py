@@ -7,6 +7,7 @@ import itertools as it
 from typing import Dict, List, Generator, Tuple, Optional
 import pylhe
 from pylhe import LHEEvent, LHEEventInfo, LHEParticle, LHEFile, LHEInit
+import vector
 
 class ColorManager:
     def __init__(self):
@@ -132,39 +133,53 @@ class EventMixer:
             except Exception as e:
                 print(f"Error reading {f}: {str(e)}")
                 continue
-    def _calculate_beam_momentum_dir(self, events: List[LHEEvent]) -> Tuple[float, float, float]:
-        total_px = sum(p.px for e in events for p in e.particles if p.status == -1)
-        total_py = sum(p.py for e in events for p in e.particles if p.status == -1)
-        total_pz = sum(p.pz for e in events for p in e.particles if p.status == -1)
-        norm = math.hypot(total_px, total_py, total_pz)
-        return (total_px/norm, total_py/norm, total_pz/norm) if norm !=0 else (0.0, 0.0, 1.0)
+    def _calculate_beam_total_p4(self, events: List[LHEEvent]) -> vector.MomentumObject4D:
+        total_px     = sum(p.px for event in events for p in event.particles if p.status == -1)
+        total_py     = sum(p.py for event in events for p in event.particles if p.status == -1)
+        total_pz     = sum(p.pz for event in events for p in event.particles if p.status == -1)
+        total_energy = sum(p.e  for event in events for p in event.particles if p.status == -1)
+        total_p4 = vector.obj(px=total_px, py=total_py, pz=total_pz, e=total_energy)
+        return total_p4
 
     def _squash_initial_gluons(self, events: List[LHEEvent]) -> LHEEvent:
         # 创建新的初态胶子对
-        total_energy = sum(p.e for e in events for p in e.particles if p.status == -1)
-        dx, dy, dz = self._calculate_beam_momentum_dir(events)
-        p_mag = total_energy / 2.0
+
+        # Reassign the gluon momenta. Begin by calculating the total momentum of the beam.
+        total_p4 = self._calculate_beam_total_p4(events)
+        total_p3_unit = total_p4.to_3D().unit()
+
+        # Project to the direction of p4 sum, and the redistribute the momentum.
+        # Assign (p_mag - E) / 2 * p_unit and (p_mag + E) / 2 * p_unit to the two gluons as the momenta.
+        gluon1_p4 = total_p3_unit.scale((total_p4.mag - total_p4.e) / 2).to_Vector4D(tau=0)
+        gluon2_p4 = total_p3_unit.scale((total_p4.mag + total_p4.e) / 2).to_Vector4D(tau=0)
+        
 
         gluon1 = LHEParticle(
             id=21, status=-1,
             mother1=0, mother2=0,
-            color1=1000, color2=1001,
-            px=p_mag * dx, py=p_mag * dy, pz=p_mag * dz,
-            e=p_mag, m=0.0,
-            lifetime=0.0, spin=0.0
+            color1=101, color2=102,
+            px=gluon1_p4.px,
+            py=gluon1_p4.py,
+            pz=gluon1_p4.pz,
+            e=gluon1_p4.e,
+            m=0.0, lifetime=0.0, spin=0.0
         )
         gluon2 = LHEParticle(
             id=21, status=-1,
             mother1=0, mother2=0,
-            color1=1001, color2=1000,
-            px=-p_mag * dx, py=-p_mag * dy, pz=-p_mag * dz,
-            e=p_mag, m=0.0,
-            lifetime=0.0, spin=0.0
+            color1=102, color2=101,
+            px=gluon2_p4.px,
+            py=gluon2_p4.py,
+            pz=gluon2_p4.pz,
+            e=gluon2_p4.e,
+            m=0.0, lifetime=0.0, spin=0.0
         )
 
         # Dealing with colored final state particles.
+        # Here's the trick: pair as much as I can, the last one connects to gluon1 and gluon2
         merged = LHEEvent(events[0].eventinfo, [])
-        prev_color2 = 1001 
+        next_color1 = 103
+        next_color2 = 104
 
         for event in events:
             for p in event.particles:
@@ -173,14 +188,20 @@ class EventMixer:
                     new_p.mother1 = 1
                     new_p.mother2 = 2
                     if p.color1 != 0 and p.color2 != 0:
-                        new_p.color1 = prev_color2
-                        new_p.color2 = prev_color2 + 1
-                        prev_color2 += 1
+                        new_p.color1 = next_color1
+                        new_p.color2 = next_color2
+                        if next_color1 < next_color2:
+                            next_color1, next_color2 = next_color2, next_color1
+                        else:
+                            next_color1 += 1
+                            next_color2 += 3
+                    
                     merged.particles.append(new_p)
 
-        # If new colored particles are added, reconnect gluon2 color.
-        if prev_color2 != 1001:
-            gluon2.color2 = prev_color2
+        # Unpaired coloured particles at the end of merged.particles
+        if next_color1 > next_color2:
+            gluon1.color2 = next_color1
+            gluon2.color1 = next_color2
 
         merged.particles.insert(0, gluon1)
         merged.particles.insert(1, gluon2)

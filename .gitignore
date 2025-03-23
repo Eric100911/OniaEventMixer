@@ -2,3 +2,4 @@
 __pycache__/*
 *.lhe
 *.json
+mix_env
