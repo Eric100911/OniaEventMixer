@@ -2,9 +2,8 @@
 import argparse
 import json
 import random
-import math
 import itertools as it
-from typing import Dict, List, Generator, Tuple, Optional
+from typing import Dict, List, Generator
 import pylhe
 from pylhe import LHEEvent, LHEEventInfo, LHEParticle, LHEFile, LHEInit
 import vector
@@ -44,44 +43,50 @@ class ParticleSource:
         self.file_iter = iter(self.files)
 
 class EventMixer:
-    def __init__(self, 
-                 config: Dict,
-                 # 新增配置参数
-                 output: Optional[str] = None,
-                 max_events: Optional[int] = None,
-                 # 原有参数
-                 filters: Optional[List[str]] = None,
-                 shuffle: Optional[bool] = None,
-                 seed: Optional[int] = None,
-                 squash: Optional[bool] = None):
+    def __init__(self, config: Dict):
         """
         参数优先级：
         1. 显式传入的参数 (最高)
         2. JSON配置参数
         3. 默认值
         """
-        
-        # 必须参数
+        # Fundamental parameters
         self.config = config['sources']
-        
-        # 合并逻辑
-        self.output = output or config.get('output', 'output.lhe')
-        self.max_events = max_events if max_events is not None else config.get('max_events', None)
-        
-        # 原有参数合并
-        self.filters = filters if filters is not None else config.get('filters', [])
-        self.shuffle = shuffle if shuffle is not None else config.get('shuffle', False)
-        self.seed = seed if seed is not None else config.get('seed', None)
-        self.squash = squash if squash is not None else config.get('squash', False)
+        self.max_events = config.get('max_events', 50000)
+        self.filters = config.get('filters', [])
+        self.shuffle = config.get('shuffle', False)
+        self.seed = config.get('seed', 42)
+        self.squash = config.get('squash', False)
+        self.buffer = config.get('buffer', 1000)
         
         # 初始化随机数
         self.rng = random.Random(self.seed)
         self.sources = {
-            name: ParticleSource(cfg, shuffle, seed)
+            name: ParticleSource(cfg, config['shuffle'], config['seed'])
             for name, cfg in config["sources"].items()
         }
         # Read init info from the first file of the first source
-        self.lhe_file_init = pylhe.read_lhe_init(self.sources[next(iter(self.sources))].files[0])
+        # Should be compatible with one-source case
+        self.lhe_file_init = pylhe.read_lhe_init((self.sources[list(self.sources.keys())[0]].files[0]))
+
+    def to_lhe_frame(self) -> LHEFile:
+        """Generate an LHEFile with anything but events"""
+        lhe_file = LHEFile()
+        
+        # 设置初始化信息
+        tmp_raw_init = self.lhe_file_init.copy()
+        tmp_raw_init["nevents"] = 0
+        tmp_raw_init["weightgroup"] = {} # Just to avoid pylhe error
+        lhe_file.init = LHEInit(**tmp_raw_init)
+        
+        # 添加文件头元数据
+        lhe_file.header_blocks = [
+            '<!-- Merged by EventMixer -->',
+            '<!-- Source config: {} -->'.format(json.dumps(self.config))
+        ]
+        
+        return lhe_file
+
 
     def to_lhe_file(self) -> LHEFile:
         """生成完整的LHE文件对象"""
@@ -118,21 +123,26 @@ class EventMixer:
             for condition in self.filters:
                 pid, expr = condition.split(':', 1)
                 if p.id == int(pid):
-                    pT = math.hypot(p.px, p.py)
-                    eta = 0.5 * math.log((p.e + p.pz)/(p.e - p.pz)) if (p.e != abs(p.pz)) else 999
+                    p4 = vector.obj(px=p.px, py=p.py, pz=p.pz, e=p.e)
+                    pT = p4.pt
+                    eta = p4.eta
                     if not eval(expr, {'pT': pT, 'eta': eta, 'abs': abs}):
                         return False
         return True
 
     def _event_generator(self, files: List[str]) -> Generator[LHEEvent, None, None]:
-        for f in files:
-            try:
-                for event in pylhe.read_lhe_with_attributes(f):
-                    if self._pass_filters(event):
-                        yield event
-            except Exception as e:
-                print(f"Error reading {f}: {str(e)}")
-                continue
+        # Create a buffer zone.
+        buffer = []
+        for file in files:
+            # Using itertools to extract events from the file and filter.
+            buffer.extend(it.filterfalse(lambda x: not self._pass_filters(x), pylhe.read_lhe_file(file).events))
+            # Once the buffer is full, do shuffling if needed, and then yield.
+            if len(buffer) >= self.buffer:
+                if self.shuffle:
+                    self.rng.shuffle(buffer)
+                yield from buffer
+                buffer.clear()
+            
     def _calculate_beam_total_p4(self, events: List[LHEEvent]) -> vector.MomentumObject4D:
         total_px     = sum(p.px for event in events for p in event.particles if p.status == -1)
         total_py     = sum(p.py for event in events for p in event.particles if p.status == -1)
@@ -307,7 +317,7 @@ class EventMixer:
 def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
     """合并命令行参数到配置字典"""
     merged = config.copy()
-    
+
     if args.output is not None:
         merged['output'] = args.output
     if args.max_events is not None:
@@ -320,25 +330,29 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
         merged['seed'] = args.seed
     if args.squash is not None:
         merged['squash'] = args.squash
+    if args.buffer is not None:
+        merged['buffer'] = args.buffer
     
     return merged
 
 def main():
     parser = argparse.ArgumentParser(description='LHE事件混合器')
     parser.add_argument('--config', required=True, type=str, 
-                      help='JSON配置文件路径')
+                        help='JSON配置文件路径')
     parser.add_argument('--output', type=str, default=None,
-                      help='覆盖配置文件中的输出路径')
+                        help='覆盖配置文件中的输出路径')
     parser.add_argument('--max-events', type=int, default=None,
-                      help='最大输出事件数（覆盖配置）')
+                        help='最大输出事件数（覆盖配置）')
     parser.add_argument('--filters', action='append', default=None,
-                      help='粒子过滤条件，格式: PID:EXPR (可多次使用)')
+                        help='粒子过滤条件，格式: PID:EXPR (可多次使用)')
     parser.add_argument('--shuffle', action=argparse.BooleanOptionalAction, 
-                      default=None, help='是否随机混合')
+                        default=None, help='是否随机混合')
     parser.add_argument('--seed', type=int, default=None,
-                      help='随机数种子')
+                        help='随机数种子')
     parser.add_argument('--squash', action=argparse.BooleanOptionalAction,
-                      default=None, help='压缩重复事件')
+                        default=None, help='压缩重复事件')
+    parser.add_argument('--buffer', type=int, default=1000,
+                        help='事件缓冲区大小')
     
     args = parser.parse_args()
     
@@ -358,11 +372,7 @@ def main():
     
     # 初始化混合器
     mixer = EventMixer(
-        config=merged_config,
-        filters=args.filters,
-        shuffle=args.shuffle,
-        seed=args.seed,
-        squash=args.squash
+        config=merged_config
     )
 
     output_file = mixer.to_lhe_file()
